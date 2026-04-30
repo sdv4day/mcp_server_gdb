@@ -243,7 +243,11 @@ impl FromStr for PrintValue {
 
 impl Display for PrintValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
+        match self {
+            PrintValue::NoValues => write!(f, "0"),
+            PrintValue::AllValues => write!(f, "1"),
+            PrintValue::SimpleValues => write!(f, "2"),
+        }
     }
 }
 

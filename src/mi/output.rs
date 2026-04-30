@@ -315,7 +315,7 @@ fn key_value(input: &str) -> IResult<&str, (String, Value)> {
 }
 
 fn token(input: &str) -> IResult<&str, u64> {
-    map(digit1, |values: &str| values.parse::<u64>().unwrap()).parse(input)
+    map_res(digit1, |values: &str| values.parse::<u64>()).parse(input)
 }
 
 /// \[token\] "^" result-class ( "," result )* nl,

@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::mi::commands::{BreakPointLocation, BreakPointNumber, MiCommand, RegisterFormat};
 use crate::mi::output::{OutOfBandRecord, ResultClass, ResultRecord};
-use crate::mi::{GDB, GDBBuilder};
+use crate::mi::{GDB, GDBBuilder, RemoteTarget};
 use crate::models::{
     BreakPoint, GDBSession, GDBSessionStatus, Memory, Register, StackFrame, Variable,
 };
@@ -55,8 +55,8 @@ impl GDBManager {
         args: Option<Vec<OsString>>,
         tty: Option<PathBuf>,
         gdb_path: Option<PathBuf>,
+        remote_target: Option<RemoteTarget>,
     ) -> AppResult<String> {
-        // Generate unique session ID
         let session_id = Uuid::new_v4().to_string();
 
         let gdb_builder = GDBBuilder {
@@ -74,10 +74,17 @@ impl GDBManager {
             opt_args: args.unwrap_or(vec![]),
             opt_program: program,
             opt_tty: tty,
+            opt_remote_target: remote_target.clone(),
         };
 
         let (oob_src, mut oob_sink) = mpsc::channel(100);
-        let gdb = gdb_builder.try_spawn(oob_src)?;
+        let mut gdb = gdb_builder.try_spawn(oob_src)?;
+
+        if let Some(target) = remote_target {
+            let command = MiCommand::target_select(&target.target_type, &target.host, target.port);
+            let _ = gdb.execute(&command).await?;
+            debug!("Connected to remote target: {}:{}", target.host, target.port);
+        }
 
         let oob_handle = tokio::spawn(async move {
             loop {
@@ -109,19 +116,20 @@ impl GDBManager {
             }
         });
 
-        // Create session information
+        let created_at = SystemTime::now().duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+        
         let session = GDBSession {
             id: session_id.clone(),
             status: GDBSessionStatus::Created,
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            created_at,
         };
 
-        // Store session
         let handle = GDBSessionHandle { info: session, gdb, oob_handle };
 
         self.sessions.lock().await.insert(session_id.clone(), handle);
 
-        // Send empty command to GDB to flush the welcome messages
         let _ = self.send_command(&session_id, &MiCommand::empty()).await?;
 
         Ok(session_id)
@@ -419,6 +427,32 @@ impl GDBManager {
     pub async fn next_execution(&self, session_id: &str) -> AppResult<String> {
         let response = self.send_command_with_timeout(session_id, &MiCommand::exec_next()).await?;
 
+        Ok(response.results.to_string())
+    }
+
+    /// Connect to a remote target (gdbserver)
+    pub async fn connect_remote(
+        &self,
+        session_id: &str,
+        target_type: &str,
+        host: &str,
+        port: u16,
+    ) -> AppResult<String> {
+        let command = MiCommand::target_select(target_type, host, port);
+        let response = self.send_command_with_timeout(session_id, &command).await?;
+        Ok(response.results.to_string())
+    }
+
+    /// Disconnect from remote target
+    pub async fn disconnect_remote(&self, session_id: &str) -> AppResult<String> {
+        let response = self.send_command_with_timeout(session_id, &MiCommand::target_disconnect()).await?;
+        Ok(response.results.to_string())
+    }
+
+    /// Load symbols from executable file
+    pub async fn load_symbols(&self, session_id: &str, file: &Path) -> AppResult<String> {
+        let command = MiCommand::file_exec_and_symbols(file);
+        let response = self.send_command_with_timeout(session_id, &command).await?;
         Ok(response.results.to_string())
     }
 }

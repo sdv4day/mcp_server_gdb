@@ -534,4 +534,24 @@ impl MiCommand {
     pub fn empty() -> MiCommand {
         MiCommand { operation: "", ..Default::default() }
     }
+
+    /// Connect to a remote target (gdbserver)
+    /// target_type: "remote", "extended-remote", etc.
+    /// host: hostname or IP address
+    /// port: port number
+    pub fn target_select(target_type: &str, host: &str, port: u16) -> MiCommand {
+        MiCommand {
+            operation: "target-select",
+            options: Some(vec![
+                OsString::from(target_type),
+                OsString::from(format!("{}:{}", host, port)),
+            ]),
+            parameters: None,
+        }
+    }
+
+    /// Disconnect from remote target
+    pub fn target_disconnect() -> MiCommand {
+        MiCommand { operation: "target-disconnect", ..Default::default() }
+    }
 }

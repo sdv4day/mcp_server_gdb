@@ -74,10 +74,15 @@ fn resolve_home(path: &str) -> Option<PathBuf> {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "A GDB/MI protocol server based on the MCP protocol, providing remote application debugging capabilities",
+    long_about = "MCP GDB Server - A GDB/MI protocol server that provides remote debugging capabilities via the MCP protocol.\n\nUsage Examples:\n\n  # Start server in stdio mode (default)\n  mcp-server-gdb\n\n  # Start server in SSE mode\n  mcp-server-gdb --transport sse\n\n  # Start server with TUI enabled (requires SSE transport)\n  mcp-server-gdb --transport sse --enable-tui\n\n  # Start server with debug log level\n  mcp-server-gdb --log-level debug\n\nRemote Debugging:\n  1. Start gdbserver on target machine: gdbserver :1234 /path/to/program\n  2. Connect via MCP tool: create_session with remote_host and remote_port parameters\n\nAvailable MCP Tools:\n  - create_session: Create a new GDB debugging session\n  - get_session: Get session information\n  - get_all_sessions: Get all sessions\n  - close_session: Close a session\n  - start_debugging: Start program execution\n  - stop_debugging: Stop program execution\n  - set_breakpoint: Set a breakpoint\n  - get_breakpoints: Get all breakpoints\n  - delete_breakpoint: Delete breakpoints\n  - get_stack_frames: Get stack frames\n  - get_local_variables: Get local variables\n  - get_registers: Get register values\n  - read_memory: Read memory contents\n  - continue_execution: Continue execution\n  - step_execution: Step into function\n  - next_execution: Step over function\n  - connect_remote: Connect to gdbserver\n  - disconnect_remote: Disconnect from gdbserver\n  - load_symbols: Load symbols from file\n"
+)]
 struct Args {
-    /// log level
-    #[arg(long, default_value = "info")]
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info", help = "Logging level: trace, debug, info, warn, or error")]
     log_level: String,
 
     /// Transport type to use
@@ -93,12 +98,12 @@ struct Args {
                 Ok(t)
             }
         }),
-        help = "Transport type to use, can only use SSE when TUI is enabled, otherwise key events can be lost"
+        help = "Transport type: stdio (default) or sse. SSE is required when TUI is enabled"
     )]
     transport: TransportType,
 
-    /// Enable TUI
-    #[arg(long)]
+    /// Enable terminal user interface (requires SSE transport)
+    #[arg(long, help = "Enable interactive terminal UI. Requires --transport sse")]
     enable_tui: bool,
 }
 
@@ -226,6 +231,18 @@ impl App {
     }
 }
 
+async fn init_logging(log_level: &str) {
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "mcp-gdb.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"))
+        }))
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     dotenv::dotenv().ok();
@@ -235,16 +252,13 @@ async fn main() -> Result<(), AppError> {
     let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "mcp-gdb.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Initialize logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"))
         }))
-        // needs to go to file due to stdio transport
         .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
         .init();
 
-    // Get configuration
     let config = config::Config::default();
     debug!("config: {:?}", config);
 
@@ -252,9 +266,7 @@ async fn main() -> Result<(), AppError> {
 
     let app = Arc::new(Mutex::new(Default::default()));
 
-    // Initialize terminal
     let ui_handle = if args.enable_tui {
-        // TODO: add panic hook to restore terminal
         enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen)?;
         match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())) {
@@ -267,7 +279,7 @@ async fn main() -> Result<(), AppError> {
                     if let Err(e) = run_app(terminal_for_tui, app_clone).await {
                         error!("failed to run app: {}", e);
                     } else {
-                        quit_sender.send(()).unwrap();
+                        let _ = quit_sender.send(());
                     }
                 });
                 Some((terminal, tui_handle, quit_receiver))
@@ -320,7 +332,6 @@ async fn main() -> Result<(), AppError> {
         }
     };
 
-    // Start transport in a separate task
     let transport_clone = transport.clone();
     let transport_handle = tokio::spawn(async move {
         if let Err(e) = transport_clone.open().await {
@@ -328,7 +339,6 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
-    // Wait for quit signal if TUI is running
     if let Some((terminal, tui_handle, quit_receiver)) = ui_handle {
         if let Err(e) = quit_receiver.await {
             error!("failed to receive quit signal: {}", e);
@@ -336,38 +346,48 @@ async fn main() -> Result<(), AppError> {
 
         tui_handle.abort();
 
-        // Restore terminal if it was initialized
         disable_raw_mode()?;
         let mut terminal = terminal.lock().await;
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         debug!("TUI closed");
     } else {
-        // If no TUI, wait for transport to complete
         debug!("waiting for transport to complete");
         if let Err(e) = transport_handle.await {
             error!("transport task error: {}", e);
         }
+        match tools::GDB_MANAGER.get_all_sessions().await {
+            Ok(sessions) => {
+                for session in sessions {
+                    let _ = tools::GDB_MANAGER.close_session(&session.id).await;
+                }
+            }
+            Err(e) => {
+                error!("failed to get sessions for cleanup: {}", e);
+            }
+        }
+        info!("MCP GDB Server shutdown complete");
         return Ok(());
     }
 
-    // Close transport
     if let Err(e) = transport.close().await {
         error!("failed to close transport: {}", e);
     }
     transport_handle.abort();
 
-    // Close all GDB sessions
-    let sessions = tools::GDB_MANAGER.get_all_sessions().await?;
-    for session in sessions {
-        if let Err(e) = tools::GDB_MANAGER.close_session(&session.id).await {
-            error!("failed to close session {}: {}", session.id, e);
+    match tools::GDB_MANAGER.get_all_sessions().await {
+        Ok(sessions) => {
+            for session in sessions {
+                let _ = tools::GDB_MANAGER.close_session(&session.id).await;
+            }
+        }
+        Err(e) => {
+            error!("failed to get sessions for cleanup: {}", e);
         }
     }
 
-    // TODO: transport is still running due to a sync call (reader.read_line) in the
-    // dependency
-    std::process::exit(0);
+    info!("MCP GDB Server shutdown complete");
+    Ok(())
 }
 
 fn scroll_down(n: usize, scroll: &mut MyScrollState, len: usize) {
@@ -495,7 +515,7 @@ async fn run_app<B: Backend + Send + 'static>(
                     }
                     KeyCode::Char('H') if app.mode == Mode::OnlyHexdump => {
                         if let Some(find_heap) = app.find_first_heap().await {
-                            let memory = GDB_MANAGER
+                            let _memory = GDB_MANAGER
                                 .read_memory(
                                     "",
                                     Some(find_heap.start_address as isize),
@@ -503,16 +523,14 @@ async fn run_app<B: Backend + Send + 'static>(
                                     find_heap.size as usize,
                                 )
                                 .await?;
-                            // TODO: print memory
 
-                            // reset position
                             app.hexdump_scroll.scroll = 0;
                             app.hexdump_scroll.state = app.hexdump_scroll.state.position(0);
                         }
                     }
                     KeyCode::Char('T') if app.mode == Mode::OnlyHexdump => {
                         if let Some(find_stack) = app.find_first_stack().await {
-                            let memory = GDB_MANAGER
+                            let _memory = GDB_MANAGER
                                 .read_memory(
                                     "",
                                     Some(find_stack.start_address as isize),
@@ -622,4 +640,7 @@ fn register_tools(builder: ServerProtocolBuilder) -> ServerProtocolBuilder {
         .register_tool(tools::GetRegistersTool::tool(), tools::GetRegistersTool::call())
         .register_tool(tools::GetRegisterNamesTool::tool(), tools::GetRegisterNamesTool::call())
         .register_tool(tools::ReadMemoryTool::tool(), tools::ReadMemoryTool::call())
+        .register_tool(tools::ConnectRemoteTool::tool(), tools::ConnectRemoteTool::call())
+        .register_tool(tools::DisconnectRemoteTool::tool(), tools::DisconnectRemoteTool::call())
+        .register_tool(tools::LoadSymbolsTool::tool(), tools::LoadSymbolsTool::call())
 }

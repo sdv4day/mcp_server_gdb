@@ -8,7 +8,7 @@ use mcp_core::types::ToolResponseContent;
 use mcp_core_macros::tool;
 
 use crate::gdb::GDBManager;
-use crate::mi::GDB;
+use crate::mi::RemoteTarget;
 
 pub static GDB_MANAGER: LazyLock<Arc<GDBManager>> =
     LazyLock::new(|| Arc::new(GDBManager::default()));
@@ -20,7 +20,8 @@ pub fn init_gdb_manager() {
 #[tool(
     name = "create_session",
     description = "Create a new GDB debugging session with optional parameters,\
-                   returns a session ID (UUID) if successful",
+                   returns a session ID (UUID) if successful. Supports both local debugging and \
+                   remote debugging via gdbserver.",
     params(
         program = "if provided, path to the executable to debug",
         nh = "if provided, do not read ~/.gdbinit file",
@@ -36,6 +37,9 @@ pub fn init_gdb_manager() {
         args = "if provided, arguments to be passed to the inferior program",
         tty = "if provided, use TTY for input/output by the program being debugged",
         gdb_path = "if provided, path to the GDB executable",
+        remote_target_type = "if provided, remote target type: 'remote' or 'extended-remote' for gdbserver connection",
+        remote_host = "if provided, hostname or IP address of the gdbserver",
+        remote_port = "if provided, port number of the gdbserver",
     )
 )]
 pub async fn create_session_tool(
@@ -53,7 +57,16 @@ pub async fn create_session_tool(
     args: Option<Vec<OsString>>,
     tty: Option<PathBuf>,
     gdb_path: Option<PathBuf>,
+    remote_target_type: Option<String>,
+    remote_host: Option<String>,
+    remote_port: Option<u16>,
 ) -> Result<ToolResponseContent> {
+    let remote_target = if let (Some(target_type), Some(host), Some(port)) = (remote_target_type, remote_host, remote_port) {
+        Some(RemoteTarget { target_type, host, port })
+    } else {
+        None
+    };
+
     let session = GDB_MANAGER
         .create_session(
             program,
@@ -70,6 +83,7 @@ pub async fn create_session_tool(
             args,
             tty,
             gdb_path,
+            remote_target,
         )
         .await?;
     Ok(tool_text_content!(format!("Created GDB session: {}", session)))
@@ -289,4 +303,48 @@ pub async fn step_execution_tool(session_id: String) -> Result<ToolResponseConte
 pub async fn next_execution_tool(session_id: String) -> Result<ToolResponseContent> {
     let ret = GDB_MANAGER.next_execution(&session_id).await?;
     Ok(tool_text_content!(format!("Stepped over next line: {}", ret)))
+}
+
+#[tool(
+    name = "connect_remote",
+    description = "Connect to a remote gdbserver target",
+    params(
+        session_id = "The ID of the GDB session",
+        target_type = "Target type: 'remote' or 'extended-remote'",
+        host = "Hostname or IP address of the gdbserver",
+        port = "Port number of the gdbserver"
+    )
+)]
+pub async fn connect_remote_tool(
+    session_id: String,
+    target_type: String,
+    host: String,
+    port: u16,
+) -> Result<ToolResponseContent> {
+    let ret = GDB_MANAGER.connect_remote(&session_id, &target_type, &host, port).await?;
+    Ok(tool_text_content!(format!("Connected to remote target {}:{}: {}", host, port, ret)))
+}
+
+#[tool(
+    name = "disconnect_remote",
+    description = "Disconnect from remote gdbserver target",
+    params(session_id = "The ID of the GDB session")
+)]
+pub async fn disconnect_remote_tool(session_id: String) -> Result<ToolResponseContent> {
+    let ret = GDB_MANAGER.disconnect_remote(&session_id).await?;
+    Ok(tool_text_content!(format!("Disconnected from remote target: {}", ret)))
+}
+
+#[tool(
+    name = "load_symbols",
+    description = "Load symbols from executable file",
+    params(
+        session_id = "The ID of the GDB session",
+        file = "Path to the executable file containing symbols"
+    )
+)]
+pub async fn load_symbols_tool(session_id: String, file: String) -> Result<ToolResponseContent> {
+    let path = PathBuf::from(&file);
+    let ret = GDB_MANAGER.load_symbols(&session_id, &path).await?;
+    Ok(tool_text_content!(format!("Loaded symbols from {}: {}", file, ret)))
 }

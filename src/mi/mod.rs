@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::Result;
+
 use output::process_output;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
@@ -31,6 +31,17 @@ pub struct GDB {
 pub enum ExecuteError {
     Busy,
     Quit,
+}
+
+/// Remote target configuration for gdbserver connection
+#[derive(Debug, Clone)]
+pub struct RemoteTarget {
+    /// Target type: "remote" or "extended-remote"
+    pub target_type: String,
+    /// Hostname or IP address of the gdbserver
+    pub host: String,
+    /// Port number of the gdbserver
+    pub port: u16,
 }
 
 /// A builder struct for configuring and launching GDB with various command line
@@ -65,6 +76,8 @@ pub struct GDBBuilder {
     pub opt_program: Option<PathBuf>,
     /// Use TTY for input/output by the program being debugged (--tty=TTY)
     pub opt_tty: Option<PathBuf>,
+    /// Remote target configuration for connecting to gdbserver
+    pub opt_remote_target: Option<RemoteTarget>,
 }
 
 impl GDBBuilder {
@@ -84,6 +97,7 @@ impl GDBBuilder {
             opt_args: Vec::new(),
             opt_program: None,
             opt_tty: None,
+            opt_remote_target: None,
         }
     }
 
@@ -102,36 +116,43 @@ impl GDBBuilder {
             gdb_args.push("--quiet".into());
         }
         if let Some(cd) = self.opt_cd {
-            gdb_args.push("--cd=".into());
-            gdb_args.last_mut().unwrap().push(&cd);
+            let mut arg = OsString::from("--cd=");
+            arg.push(&cd);
+            gdb_args.push(arg);
         }
         if let Some(bps) = self.opt_bps {
             gdb_args.push("-b".into());
             gdb_args.push(bps.to_string().into());
         }
         if let Some(symbol_file) = self.opt_symbol_file {
-            gdb_args.push("--symbols=".into());
-            gdb_args.last_mut().unwrap().push(&symbol_file);
+            let mut arg = OsString::from("--symbols=");
+            arg.push(&symbol_file);
+            gdb_args.push(arg);
         }
         if let Some(core_file) = self.opt_core_file {
-            gdb_args.push("--core=".into());
-            gdb_args.last_mut().unwrap().push(&core_file);
+            let mut arg = OsString::from("--core=");
+            arg.push(&core_file);
+            gdb_args.push(arg);
         }
         if let Some(proc_id) = self.opt_proc_id {
-            gdb_args.push("--pid=".into());
-            gdb_args.last_mut().unwrap().push(proc_id.to_string());
+            let mut arg = OsString::from("--pid=");
+            arg.push(proc_id.to_string());
+            gdb_args.push(arg);
         }
         if let Some(command) = self.opt_command {
-            gdb_args.push("--command=".into());
-            gdb_args.last_mut().unwrap().push(&command);
+            let mut arg = OsString::from("--command=");
+            arg.push(&command);
+            gdb_args.push(arg);
         }
         if let Some(source_dir) = self.opt_source_dir {
-            gdb_args.push("--directory=".into());
-            gdb_args.last_mut().unwrap().push(&source_dir);
+            let mut arg = OsString::from("--directory=");
+            arg.push(&source_dir);
+            gdb_args.push(arg);
         }
         if let Some(tty) = self.opt_tty {
-            gdb_args.push("--tty=".into());
-            gdb_args.last_mut().unwrap().push(&tty);
+            let mut arg = OsString::from("--tty=");
+            arg.push(&tty);
+            gdb_args.push(arg);
         }
         if !self.opt_args.is_empty() {
             gdb_args.push("--args".into());
@@ -161,7 +182,7 @@ impl GDBBuilder {
             .spawn()
             .map_err(|e| AppError::GDBError(format!("Failed to start GDB process: {}", e)))?;
 
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| AppError::GDBError("Failed to get stdout from GDB process".to_string()))?);
         let is_running = Arc::new(AtomicBool::new(false));
         let is_running_clone = is_running.clone();
         let (result_input, result_output) = mpsc::channel(100);
@@ -181,14 +202,17 @@ impl GDBBuilder {
 
 impl GDB {
     #[cfg(unix)]
-    pub async fn interrupt_execution(&self) -> Result<(), nix::Error> {
+    pub async fn interrupt_execution(&self) -> AppResult<()> {
         use nix::sys::signal;
         use nix::unistd::Pid;
-        signal::kill(Pid::from_raw(self.process.lock().await.id().unwrap() as i32), signal::SIGINT)
+        let pid = self.process.lock().await.id().ok_or_else(|| AppError::GDBError("Failed to get process ID".to_string()))?;
+        signal::kill(Pid::from_raw(pid as i32), signal::SIGINT)
+            .map_err(|e| AppError::GDBError(format!("Failed to send interrupt: {}", e)))?;
+        Ok(())
     }
 
     #[cfg(windows)]
-    pub async fn interrupt_execution(&self) -> Result<()> {
+    pub async fn interrupt_execution(&self) -> AppResult<()> {
         Ok(())
     }
 
@@ -231,7 +255,7 @@ impl GDB {
                 command_token,
             )
             .await
-            .expect("write interpreter command");
+            .map_err(|e| AppError::GDBError(format!("Failed to write interpreter command: {}", e)))?;
 
         match self.result_output.recv().await {
             Some(record) => match record.token {
@@ -255,17 +279,24 @@ impl GDB {
         }
     }
 
-    pub async fn execute_later<C: std::borrow::Borrow<commands::MiCommand>>(&mut self, command: C) {
+    pub async fn execute_later<C: std::borrow::Borrow<commands::MiCommand>>(&mut self, command: C) -> AppResult<()> {
         let command_token = self.new_token();
         command
             .borrow()
             .write_interpreter_string(
-                &mut self.process.lock().await.stdin.as_mut().unwrap(),
+                &mut self
+                    .process
+                    .lock()
+                    .await
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| AppError::GDBError("Failed to get stdin".to_string()))?,
                 command_token,
             )
             .await
-            .expect("write interpreter command");
+            .map_err(|e| AppError::GDBError(format!("Failed to write interpreter command: {}", e)))?;
         let _ = self.result_output.recv().await;
+        Ok(())
     }
 
     pub async fn is_session_active(&mut self) -> AppResult<bool> {

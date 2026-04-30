@@ -89,9 +89,9 @@ fn deref_bytes_to_registers(
 ) {
     let windows = if thirty { 4 } else { 8 };
     for w in chunk.windows(windows) {
+        let endian = endian.unwrap_or(Endian::Little);
         let bytes_val = if thirty {
-            let val = if endian.unwrap() == Endian::Big {
-                // TODO: try_into()
+            let val = if endian == Endian::Big {
                 u32::from_be_bytes([w[0], w[1], w[2], w[3]])
             } else {
                 u32::from_le_bytes([w[0], w[1], w[2], w[3]])
@@ -99,7 +99,7 @@ fn deref_bytes_to_registers(
 
             val as u64
         } else {
-            if endian.unwrap() == Endian::Big {
+            if endian == Endian::Big {
                 u64::from_be_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
             } else {
                 u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
@@ -161,7 +161,7 @@ pub fn draw_hexdump<'a>(app: &mut App, f: &mut Frame<'a>, hexdump: Rect) {
     let mut pos = "".to_string();
 
     if hexdump_active {
-        let r = app.hexdump.clone().unwrap();
+        let r = app.hexdump.clone().expect("hexdump_active check failed");
         pos = format!("(0x{:02x?})", r.0);
         let data = &r.1;
 
